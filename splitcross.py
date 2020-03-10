@@ -168,7 +168,8 @@ class SplitCrossEntropyLoss(nn.Module):
                 entropy = -(head_entropy + tail_entropy)
             ###
             running_offset += len(split_hiddens[idx])
-            total_loss = entropy.float().sum() if total_loss is None else total_loss + entropy.float().sum()
+            #total_loss = entropy.float().sum() if total_loss is None else total_loss + entropy.float().sum()
+            total_loss = entropy.float() if total_loss is None else total_loss + entropy.float()
 
         return (total_loss / len(targets)).type_as(weight)
 

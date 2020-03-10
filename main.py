@@ -52,13 +52,13 @@ def evaluate(model, criterion, args, data_source, batch_size=10):
             data, targets = get_batch(data_source, i, args, evaluation=True)
             #output, hidden = model(data, hidden)
             output, hidden, mems = model(data, hidden, mems=mems, return_h=False)
-            total_loss += len(data) * criterion(model.decoder.weight, model.decoder.bias, output, targets.view(-1)).data
+            total_loss += len(data) * criterion(model.decoder.weight, model.decoder.bias, output, targets.view(-1)).sum().data
             if hidden is not None:
                 hidden = repackage_hidden(hidden)
     return total_loss.item() / len(data_source)
 
 
-def train(model, optimizer, criterion, args, train_data, amp, params, epoch=0, max_steps=-1):
+def train(model, optimizer, criterion, args, train_data, amp, params, epoch=0, max_steps=-1, discard_highest_losses=0.0):
     # Turn on training mode which enables dropout.
     if args.model == 'QRNN' and getattr(model, 'reset', None): model.reset()
     total_loss = 0
@@ -120,8 +120,9 @@ def train(model, optimizer, criterion, args, train_data, amp, params, epoch=0, m
         #output, hidden, rnn_hs, dropped_rnn_hs = model(data, hidden, return_h=True)
         #output, hidden, mems, attn_outs, _ = model(data, hidden, return_h=True, mems=mems)
         output, hidden, mems, attn_outs, _ = model(data, hidden, return_h=True, mems=mems)
-        raw_loss = criterion(model.decoder.weight, model.decoder.bias, output, targets.view(-1))
+        raw_loss = criterion(model.decoder.weight, model.decoder.bias, output, targets.view(-1)).view(-1)
 
+        #assert torch.allclose(raw_loss, raw_loss_new.sum()), f'new loss is different: {raw_loss} != {raw_loss_new.sum()}'
         losses.append(raw_loss)
 
         if False and mems:
@@ -150,7 +151,17 @@ def train(model, optimizer, criterion, args, train_data, amp, params, epoch=0, m
         '''
 
         if batch % loss_every_n_batches == 0:
-            loss = functools.reduce(lambda x, y: x + y, losses)
+            #loss = functools.reduce(lambda x, y: x + y, losses)
+
+            # discard highest losses
+            losses = torch.cat(losses)
+            # discard_highest_losses
+            _, indices = torch.sort(losses)
+            n_discard = int(len(indices) * discard_highest_losses)
+            indices_discard = indices[:-n_discard]
+            losses[indices_discard] = 0.0
+
+            loss = losses.sum()
             #print(losses)
             #loss.backward()
             with amp.scale_loss(loss, optimizer) as scaled_loss:
@@ -181,7 +192,7 @@ def train(model, optimizer, criterion, args, train_data, amp, params, epoch=0, m
                 b.rnn.weight_hh_l0.data[~m] = w[~m]
                 b.rnn.flatten_parameters()
 
-        total_loss += raw_loss.data
+        total_loss += raw_loss.sum().data
         #optimizer.param_groups[0]['lr'] = lr2
         if batch % args.log_interval == 0 and batch > 0:
             cur_loss = total_loss.item() / args.log_interval
@@ -261,6 +272,9 @@ def main():
                         help='optimizer to use (sgd, adam)')
     parser.add_argument('--when', nargs="+", type=int, default=[-1],
                         help='When (which epochs) to divide the learning rate by 10 - accepts multiple')
+    parser.add_argument('--discard-highest-losses', type=float, default=0.0,
+                        help='discard highest percentage of prediction losses before executing an optimizer step')
+
     args = parser.parse_args()
     args.tied = True
 
@@ -390,7 +404,8 @@ def main():
 
         for epoch in range(1, args.epochs+1):
             epoch_start_time = time.time()
-            train(model, optimizer, criterion, args, train_data, amp, params, epoch=epoch - 1, max_steps=args.max_steps_per_epoch)
+            train(model, optimizer, criterion, args, train_data, amp, params, epoch=epoch - 1,
+                  max_steps=args.max_steps_per_epoch, discard_highest_losses=args.discard_highest_losses)
             if 't0' in optimizer.param_groups[0]:
                 tmp = {}
                 for prm in model.parameters():
