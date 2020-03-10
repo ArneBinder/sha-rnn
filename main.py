@@ -420,12 +420,15 @@ def main():
 
         for epoch in range(1, args.epochs+1):
             epoch_start_time = time.time()
+            discard_highest_losses = args.discard_highest_losses * (args.epochs - epoch + 1) / args.epochs
             if args.enlarge_model_every_n_epochs > 0 and (epoch - 1) % args.enlarge_model_every_n_epochs == 0:
-                print('enlarge model')
                 prev_model = model
                 current_factor = (args.enlarge_model_every_n_epochs + epoch - 1) / (args.epochs - args.enlarge_model_every_n_epochs)
-                model = SHARNN(args.model, ntokens, int(args.emsize * current_factor), int(args.nhid * current_factor), args.nlayers, args.dropout, args.dropouth, args.dropouti, args.dropoute, args.wdrop, args.tied)
-                criterion = SplitCrossEntropyLoss(int(args.emsize * current_factor), splits=splits, verbose=False)
+                emsize = int(args.emsize * current_factor)
+                nhid = int(args.nhid * current_factor)
+                print(f'enlarge model: emsize={emsize}, nhid={nhid} (discard_highest_losses={discard_highest_losses})')
+                model = SHARNN(args.model, ntokens, emsize, nhid, args.nlayers, args.dropout, args.dropouth, args.dropouti, args.dropoute, args.wdrop, args.tied)
+                criterion = SplitCrossEntropyLoss(emsize, splits=splits, verbose=False)
                 if args.cuda:
                     model = model.cuda()
                     criterion = criterion.cuda()
@@ -435,7 +438,7 @@ def main():
 
             train(model, optimizer, criterion, args, train_data, params, epoch=epoch - 1,
                   max_steps=args.max_steps_per_epoch,
-                  discard_highest_losses=args.discard_highest_losses * (args.epochs - epoch + 1) / args.epochs)
+                  discard_highest_losses=discard_highest_losses)
             if 't0' in optimizer.param_groups[0]:
                 tmp = {}
                 for prm in model.parameters():
