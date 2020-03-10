@@ -227,6 +227,32 @@ class Block(nn.Module):
 
         return h, new_mem, new_hidden, focus
 
+
+def get_freeze_hook(shape):
+
+    def _hook(grad):
+        if len(grad.size()) == 1:
+            _grad = grad.clone()
+            _grad[:shape[0]] = 0.0
+            return _grad
+        elif len(grad.size()) == 2:
+            _grad = grad.clone()
+            _grad[:shape[0], :shape[1]] = 0.0
+            return _grad
+        elif len(grad.size()) == 3:
+            _grad = grad.clone()
+            _grad[:shape[0], :shape[1], :shape[2]] = 0.0
+            return _grad
+        elif len(grad.size()) == 4:
+            _grad = grad.clone()
+            _grad[:shape[0], :shape[1], :shape[2], :shape[3]] = 0.0
+            return _grad
+        elif len(grad.size()) > 2:
+            raise ValueError('not yet implemented')
+
+    return _hook
+
+
 class SHARNN(nn.Module):
     def __init__(self, rnn_type, ntoken, ninp, nhid, nlayers, dropout=0.5, dropouth=0.5, dropouti=0.5, dropoute=0.1, wdrop=0, tie_weights=False):
         super().__init__()
@@ -273,6 +299,29 @@ class SHARNN(nn.Module):
 
         if isinstance(module, (nn.Linear, nn.LayerNorm)) and module.bias is not None:
             module.bias.data.zero_()
+
+    def load_from_smaller_and_freeze(self, smaller):
+        params_dict = {name: param for name, param in self.named_parameters()}
+        other_params_dict = {name: param for name, param in smaller.named_parameters()}
+        for name, other_param in other_params_dict.items():
+            param = params_dict[name]
+            if param.size() == other_param.size():
+                param.data = other_param.data
+            else:
+                assert len(param.size()) == len(other_param.size()), \
+                    f'number of shape dimensions does not match: {param.size()} vs. {other_param.size()}'
+
+                if len(param.size()) == 1:
+                    param.data[:other_param.size(0)] = other_param.data
+                elif len(param.size()) == 2:
+                    param.data[:other_param.size(0), :other_param.size(1)] = other_param.data
+                elif len(param.size()) == 3:
+                    param.data[:other_param.size(0), :other_param.size(1), :other_param.size(2)] = other_param.data
+                elif len(param.size()) == 4:
+                    param.data[:other_param.size(0), :other_param.size(1), :other_param.size(2), :other_param.size(3)] = other_param.data
+                else:
+                    raise ValueError('not yet implemented')
+                param.register_hook(get_freeze_hook(other_param.size()))
 
     def forward(self, x, hidden=None, mems=None, padding_mask=None, return_h=True):
         """ Input has shape [seq length, batch] """

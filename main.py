@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
+from apex import amp
 
 import data
 from model import SHARNN
@@ -58,7 +59,7 @@ def evaluate(model, criterion, args, data_source, batch_size=10):
     return total_loss.item() / len(data_source)
 
 
-def train(model, optimizer, criterion, args, train_data, amp, params, epoch=0, max_steps=-1, discard_highest_losses=0.0):
+def train(model, optimizer, criterion, args, train_data, params, epoch=0, max_steps=-1, discard_highest_losses=0.0):
     # Turn on training mode which enables dropout.
     if args.model == 'QRNN' and getattr(model, 'reset', None): model.reset()
     total_loss = 0
@@ -208,6 +209,39 @@ def train(model, optimizer, criterion, args, train_data, amp, params, epoch=0, m
         i += seq_len
 
 
+def init_optimizer(args, model, criterion):
+    params = list(model.parameters()) + list(criterion.parameters())
+    total_params = sum(x.size()[0] * x.size()[1] if len(x.size()) > 1 else x.size()[0] for x in params if x.size())
+    print('Args:', args)
+    print('Model total parameters:', total_params)
+
+    optimizer = None
+    # Ensure the optimizer is optimizing params, which includes both the model's weights as well as the criterion's weight (i.e. Adaptive Softmax)
+    if args.optimizer == 'sgd':
+        optimizer = torch.optim.SGD(params, lr=args.lr, weight_decay=args.wdecay)
+    if args.optimizer == 'adagrad':
+        optimizer = torch.optim.Adagrad(params, lr=args.lr, weight_decay=args.wdecay)
+    if args.optimizer == 'adam':
+        optimizer = torch.optim.Adam(params, lr=args.lr, weight_decay=args.wdecay)
+    if args.optimizer == 'adamw':
+        optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.wdecay)
+    if args.optimizer == 'lamb':
+        from pytorch_lamb import Lamb
+        optimizer = Lamb(params, lr=args.lr, weight_decay=args.wdecay, min_trust=0.25)
+        # optimizer = Lamb(params, lr=args.lr, weight_decay=args.wdecay, min_trust=0.1)
+        # optimizer = Lamb(params, lr=args.lr, weight_decay=args.wdecay, min_trust=0, random_min_trust=0.2, random_trust_dice=10)
+        # optimizer = Lamb(params, lr=args.lr, weight_decay=args.wdecay, min_trust=0.2, random_min_trust=0.5, random_trust_dice=4)
+    from lookahead import Lookahead
+    if False:
+        k, alpha = 5, 0.8
+        print('Lookahead - k {} and alpha {}'.format(k, alpha))
+        optimizer = Lookahead(base_optimizer=optimizer, k=k, alpha=alpha)
+
+    model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
+    # model, optimizer = amp.initialize(model, optimizer, opt_level='O2')
+    return model, optimizer, params
+
+
 def main():
 
     parser = argparse.ArgumentParser(description='PyTorch PennTreeBank RNN/LSTM Language Model')
@@ -274,6 +308,8 @@ def main():
                         help='When (which epochs) to divide the learning rate by 10 - accepts multiple')
     parser.add_argument('--discard-highest-losses', type=float, default=0.0,
                         help='discard highest percentage of prediction losses before executing an optimizer step')
+    parser.add_argument('--enlarge-model-every-n-epochs', type=int, default=-1,
+                        help='enlarge model (hidden and embedding dims) after every n epochs')
 
     args = parser.parse_args()
     args.tied = True
@@ -320,49 +356,52 @@ def main():
     print('Total number of tokens:', ntokens)
     #model = model.RNNModel(args.model, ntokens, args.emsize, args.nhid, args.nlayers, args.dropout, args.dropouth, args.dropouti, args.dropoute, args.wdrop, args.tied)
     #model = model.BoomRNNModel(args.model, ntokens, args.emsize, args.nhid, args.nlayers, args.dropout, args.dropouth, args.dropouti, args.dropoute, args.wdrop, args.tied)
-    model = SHARNN(args.model, ntokens, args.emsize, args.nhid, args.nlayers, args.dropout, args.dropouth, args.dropouti, args.dropoute, args.wdrop, args.tied)
+    if args.enlarge_model_every_n_epochs <= 0:
+        model = SHARNN(args.model, ntokens, args.emsize, args.nhid, args.nlayers, args.dropout, args.dropouth, args.dropouti, args.dropoute, args.wdrop, args.tied)
+    else:
+        model = None
     #model = model.AttnRNNModel(args.model, ntokens, args.emsize, args.nhid, args.nlayers, args.dropout, args.dropouth, args.dropouti, args.dropoute, args.wdrop, args.tied)
     #model = model.RecAttn(args.model, ntokens, args.emsize, args.nhid, args.nlayers, args.dropout, args.dropouth, args.dropouti, args.dropoute, args.wdrop, args.tied)
     #model = model.LNRNN(args.model, ntokens, args.emsize, args.nhid, args.nlayers, args.dropout, args.dropouth, args.dropouti, args.dropoute, args.wdrop, args.tied)
     #model = model.LNRR(args.model, ntokens, args.emsize, args.nhid, args.nlayers, args.dropout, args.dropouth, args.dropouti, args.dropoute, args.wdrop, args.tied)
     ###
-    if args.resume and args.epochs > 0:
-        print('Resuming model ...')
-        criterion = model_load(args.resume, model)
-        #optimizer.param_groups[0]['lr'] = args.lr
-        model.dropouti, model.dropouth, model.dropout, args.dropoute = args.dropouti, args.dropouth, args.dropout, args.dropoute
-        #if args.wdrop:
-        #    from weight_drop import WeightDrop
-        #    for rnn in model.rnns:
-        #        if type(rnn) == WeightDrop: rnn.dropout = args.wdrop
-        #        elif rnn.zoneout > 0: rnn.zoneout = args.wdrop
-    ###
-    if not criterion:
-        splits = []
-        if ntokens > 500000:
-            # One Billion
-            # This produces fairly even matrix mults for the buckets:
-            # 0: 11723136, 1: 10854630, 2: 11270961, 3: 11219422
-            splits = [4200, 35000, 180000]
-        elif ntokens > 75000:
-            # WikiText-103
-            splits = [2800, 20000, 76000]
-        print('Using', splits)
-        criterion = SplitCrossEntropyLoss(args.emsize, splits=splits, verbose=False)
-    ###
-    if args.cuda:
-        model = model.cuda()
-        criterion = criterion.cuda()
-    if False: # or args.jit:
-        print('Jitting ...')
-        model.eval()
-        model.lmr = torch.jit.trace(model.lmr, (torch.rand([args.bptt, args.batch_size, args.emsize]).cuda(), torch.rand([1, args.batch_size, args.emsize]).cuda()))
-    #model = torch.jit.trace_module(model, torch.zeros((args.bptt, args.batch_size), dtype=torch.long))
-    ###
-    params = list(model.parameters()) + list(criterion.parameters())
-    total_params = sum(x.size()[0] * x.size()[1] if len(x.size()) > 1 else x.size()[0] for x in params if x.size())
-    print('Args:', args)
-    print('Model total parameters:', total_params)
+
+    splits = []
+    if ntokens > 500000:
+        # One Billion
+        # This produces fairly even matrix mults for the buckets:
+        # 0: 11723136, 1: 10854630, 2: 11270961, 3: 11219422
+        splits = [4200, 35000, 180000]
+    elif ntokens > 75000:
+        # WikiText-103
+        splits = [2800, 20000, 76000]
+    print('Using', splits)
+
+    if model is not None:
+        if args.resume and args.epochs > 0:
+            print('Resuming model ...')
+            criterion = model_load(args.resume, model)
+            #optimizer.param_groups[0]['lr'] = args.lr
+            model.dropouti, model.dropouth, model.dropout, args.dropoute = args.dropouti, args.dropouth, args.dropout, args.dropoute
+            #if args.wdrop:
+            #    from weight_drop import WeightDrop
+            #    for rnn in model.rnns:
+            #        if type(rnn) == WeightDrop: rnn.dropout = args.wdrop
+            #        elif rnn.zoneout > 0: rnn.zoneout = args.wdrop
+        ###
+        if not criterion:
+
+            criterion = SplitCrossEntropyLoss(args.emsize, splits=splits, verbose=False)
+        ###
+        if args.cuda:
+            model = model.cuda()
+            criterion = criterion.cuda()
+        if False: # or args.jit:
+            print('Jitting ...')
+            model.eval()
+            model.lmr = torch.jit.trace(model.lmr, (torch.rand([args.bptt, args.batch_size, args.emsize]).cuda(), torch.rand([1, args.batch_size, args.emsize]).cuda()))
+        #model = torch.jit.trace_module(model, torch.zeros((args.bptt, args.batch_size), dtype=torch.long))
+        ###
 
     ###############################################################################
     # Training code
@@ -370,41 +409,31 @@ def main():
 
 
     # Loop over epochs.
-    lr = args.lr
+    #lr = args.lr
     best_val_loss = []
     stored_loss = 100000000
 
     # At any point you can hit Ctrl + C to break out of training early.
     try:
-        optimizer = None
-        # Ensure the optimizer is optimizing params, which includes both the model's weights as well as the criterion's weight (i.e. Adaptive Softmax)
-        if args.optimizer == 'sgd':
-            optimizer = torch.optim.SGD(params, lr=args.lr, weight_decay=args.wdecay)
-        if args.optimizer == 'adagrad':
-            optimizer = torch.optim.Adagrad(params, lr=args.lr, weight_decay=args.wdecay)
-        if args.optimizer == 'adam':
-            optimizer = torch.optim.Adam(params, lr=args.lr, weight_decay=args.wdecay)
-        if args.optimizer == 'adamw':
-            optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.wdecay)
-        if args.optimizer == 'lamb':
-            from pytorch_lamb import Lamb
-            optimizer = Lamb(params, lr=args.lr, weight_decay=args.wdecay, min_trust=0.25)
-            #optimizer = Lamb(params, lr=args.lr, weight_decay=args.wdecay, min_trust=0.1)
-            #optimizer = Lamb(params, lr=args.lr, weight_decay=args.wdecay, min_trust=0, random_min_trust=0.2, random_trust_dice=10)
-            #optimizer = Lamb(params, lr=args.lr, weight_decay=args.wdecay, min_trust=0.2, random_min_trust=0.5, random_trust_dice=4)
-        from lookahead import Lookahead
-        if False:
-            k, alpha = 5, 0.8
-            print('Lookahead - k {} and alpha {}'.format(k, alpha))
-            optimizer = Lookahead(base_optimizer=optimizer, k=k, alpha=alpha)
-
-        from apex import amp
-        model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
-        #model, optimizer = amp.initialize(model, optimizer, opt_level='O2')
+        if model is not None:
+            model, optimizer, params = init_optimizer(args, model, criterion)
 
         for epoch in range(1, args.epochs+1):
             epoch_start_time = time.time()
-            train(model, optimizer, criterion, args, train_data, amp, params, epoch=epoch - 1,
+            if args.enlarge_model_every_n_epochs > 0 and (epoch - 1) % args.enlarge_model_every_n_epochs == 0:
+                print('enlarge model')
+                prev_model = model
+                current_factor = (args.enlarge_model_every_n_epochs + epoch - 1) / (args.epochs - args.enlarge_model_every_n_epochs)
+                model = SHARNN(args.model, ntokens, int(args.emsize * current_factor), int(args.nhid * current_factor), args.nlayers, args.dropout, args.dropouth, args.dropouti, args.dropoute, args.wdrop, args.tied)
+                criterion = SplitCrossEntropyLoss(int(args.emsize * current_factor), splits=splits, verbose=False)
+                if args.cuda:
+                    model = model.cuda()
+                    criterion = criterion.cuda()
+                if prev_model is not None:
+                    model.load_from_smaller_and_freeze(prev_model)
+                model, optimizer, params = init_optimizer(args, model, criterion)
+
+            train(model, optimizer, criterion, args, train_data, params, epoch=epoch - 1,
                   max_steps=args.max_steps_per_epoch,
                   discard_highest_losses=args.discard_highest_losses * (args.epochs - epoch + 1) / args.epochs)
             if 't0' in optimizer.param_groups[0]:
