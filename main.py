@@ -405,7 +405,8 @@ def main():
         for epoch in range(1, args.epochs+1):
             epoch_start_time = time.time()
             train(model, optimizer, criterion, args, train_data, amp, params, epoch=epoch - 1,
-                  max_steps=args.max_steps_per_epoch, discard_highest_losses=args.discard_highest_losses)
+                  max_steps=args.max_steps_per_epoch,
+                  discard_highest_losses=args.discard_highest_losses * (args.epochs - epoch + 1) / args.epochs)
             if 't0' in optimizer.param_groups[0]:
                 tmp = {}
                 for prm in model.parameters():
