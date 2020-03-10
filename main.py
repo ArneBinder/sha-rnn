@@ -423,7 +423,7 @@ def main():
             discard_highest_losses = args.discard_highest_losses * (args.epochs - epoch + 1) / args.epochs
             if args.enlarge_model_every_n_epochs > 0 and (epoch - 1) % args.enlarge_model_every_n_epochs == 0:
                 prev_model = model
-                current_factor = (args.enlarge_model_every_n_epochs + epoch - 1) / (args.epochs - args.enlarge_model_every_n_epochs)
+                current_factor = (args.enlarge_model_every_n_epochs + epoch - 1) / (args.enlarge_model_every_n_epochs + args.epochs)
                 emsize = int(args.emsize * current_factor)
                 nhid = int(args.nhid * current_factor)
                 print(f'enlarge model: emsize={emsize}, nhid={nhid} (discard_highest_losses={discard_highest_losses})')
